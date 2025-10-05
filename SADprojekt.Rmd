@@ -1,0 +1,761 @@
+---
+title: "Zadanie zaliczeniowe Statystyczna Analiza Danych 24/25L" 
+author: "Maksymilian Kulicki" 
+date: "2025-06-01" 
+output: 
+    html_document: 
+        toc: true 
+        toc_depth: 2
+        df_print: paged
+        
+---     
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(ggplot2)
+library(dplyr)
+library(knitr)
+library(pheatmap)
+library(nortest)
+library(goftest)
+library(glmnet)
+library(ranger)
+```
+
+
+
+# 1. Eksploracja danych
+
+Dane do zadania zostały pobrane ze strony: <https://www.kaggle.com/competitions/sad-2024-25-lab-grupa-2/data?select=y_train.csv>. Dane pochodzą z eksperymentu multimodalnego sekwencjonowania pojedynczych komórek (scRNA-seq) przeprowadzonego na komórkach szpiku kostnego ludzkich dawców. Dla każdej komórki dostępne są informacje o ekspresji genów (macierz RNA) oraz ilości jednego białka powierzchniowego -- CD36. Zbiór danych zawiera głównie komórki układu immunologicznego i może służyć do przewidywania poziomu białka CD36 na podstawie aktywności genów. Wczytujemy dane.
+
+```{r}
+X_test  <- read.csv("X_test.csv")
+X_train <- read.csv("X_train.csv")
+Y_train <- read.csv("y_train.csv")
+```
+---
+
+## 1.1 Podstawowe informacje o danych
+
+Dane treningowe X_train oraz Y_train zawierają 6800 obserwacji. Macierz X_train zawiera 9000 zmiennych objaśniających, a Y_train jest zmienna objaśnianą, więc jest wektorem. Dane testowe X_test zawierają tyle samo zmiennych objaśniających oraz 1200 obserwacji. Dane są czyste - nie zawierają pustych wartości oraz wszyskie są typu double.
+
+```{r, results = 'hold'}
+# --- Rozmiar danych ---
+cat("Rozmiar danych \n")
+cat("Dane treningowe - RNA: ", dim(X_train), "\n")
+cat("Dane testowe   - RNA: ", dim(X_test),  "\n")
+cat("Dane treningowe - białko: ", dim(Y_train), "\n\n")
+
+# --- Brakujące wartości ---
+cat("Brakujące wartości \n")
+cat("Brakujące dane treningowe - RNA: ", any(is.na(X_train)), "\n")
+cat("Brakujące dane testowe   - RNA: ", any(is.na(X_test)),  "\n")
+cat("Brakujące dane treningowe - białko: ", any(is.na(Y_train)), "\n\n")
+
+# --- Typy zmiennych  ---
+typy1 <- sapply(X_train, typeof)
+typy2 <- sapply(X_test, typeof)
+typy3 <- sapply(Y_train, typeof)
+cat("Typy zmiennych \n")
+cat("Typy zmiennych w X_train:\n", unique(typy1), "\n")
+cat("Typy zmiennych w X_test:\n", unique(typy2), "\n")
+cat("Typy zmiennych w Y_train:\n", unique(typy3), "\n")
+```
+
+---
+
+## 1.2 Zmienna objaśniana
+
+Przyjrzyjmy się zmiennej objaśnianej zaczynając od wizualizacji jej rozkładu empirycznego.
+
+### Rozkład empiryczny
+
+```{r}
+# Histogram z gęstością
+ggplot(Y_train, aes(x = CD36)) +
+  geom_histogram(aes(y = ..density..),
+                 bins = 30,
+                 fill = "lightblue",
+                 color = "black") +
+  geom_density(color = "red", size = 1) +
+  labs(title = "Histogram zmiennej objaśnianej",
+       x = "CD36",
+       y = "Gęstość") +
+  theme_minimal()
+```
+
+Patrząc na rozkład empiryczny Y_train ciężko powiedzieć z jakiego rozkładu mógłby pochodzić. Przedstawmy podstawowe statystyki rozkładu, czyli między innymi max wartość, min wartość, średnią, medianę.
+
+### Statystyki opisowe
+
+```{r}
+summary(Y_train)
+```
+
+---
+
+## 1.3 Analiza korelacji
+
+Wybieramy 250 zmiennych objaśniających najbardziej skorelowanych z CD36 i obrazujemy korelacje na mapie cieplnej.
+
+```{r}
+# Korelacje z CD36
+cors   <- cor(X_train, Y_train)
+# 250 najlepszych
+X_cor  <- X_train[, order(abs(cors), decreasing = TRUE)[1:250]]
+cor_mat <- cor(X_cor)
+
+# Heatmapa korelacji
+pheatmap(
+   cor_mat,
+   color = colorRampPalette(c("blue", "white", "red"))(100),
+   show_rownames = FALSE,
+   show_colnames = FALSE,
+   main = "Heatmapa korelacji 250 zmiennych")
+```
+
+
+Z mapy wynika, że niektóre zmienne są ze sobą mocno skorelowane.
+
+
+---
+
+
+# 2. Testy statystyczne
+
+## 2.1 Wykres kwantylowy zmiennej objaśnianej
+
+Przyjrzyjmy się wykresowi kwantylowemu (ang. QQ-plot), żeby porównać zmienną objaśnianą z rozkładem normalnym.
+
+```{r}
+ggplot(Y_train, aes(sample = CD36)) +
+  geom_qq() +
+  geom_qq_line(colour = "red", linewidth = 1) +
+  labs(
+    title = "Wykres kwantylowy: CD36 vs. kwantyle standardowego rozkładu normalnego",
+    x = "Teoretyczne kwantyle",
+    y = "Empiryczne kwantyle CD36"
+  ) +
+  theme_minimal()
+
+```
+
+
+Z wykresu trudno jest odczytać wartości średniej lub wariancji. Można jednak powiedzieć jak one się mają w stosunku do standardowego rozkładu normalnego. Z wykresu wynika, że średnia jest większa, ponieważ środek rozkładu Y_train jest przesunięty w prawo względem 0. Można zauważyć również, że odchylenie standardowe, które jest współczynnikiem nachylenia prostej na wykresie jest większe w przypadku rozkładu CD-36. 
+
+
+---
+
+## 2.2 Testowanie zgodności z rozkładem normalnym 
+
+Aby przeprowadzić test zgodności z rozkładem normalnym (o nieznanej wartości oczekiwanej i wariancji) najpierw musimy wybrać test. Na wykładzie został przedstawiony test Shapiro-Wilka. Z tym testem wiążę się jeden minus, a mianowicie w R działa tylko do 5000 obserwacji, więc w naszym przypadku musimy wybrać losową pod-próbę z naszych 6000 obserwacji. Innym testem na zgodność z rozkładem normalnym jest test Andersona-Darlinga (zob. https://pl.wikipedia.org/wiki/Test_Andersona-Darlinga) z pakietu nortest. Przeprowadzimy oba te testy. Zacznijmy od sformułowania hipotezy zerowej i alternatywnej.
+
+$H_0$: Rozkład zmiennej objaśnianej pochodzi z rozkładu normalnego(o nieznanym $\mu$ i $\sigma^2$).
+
+$H_1$: Rozkład nie pochodzi z rozkładu normalnego.
+
+
+Ustalamy następujący poziom istotności : $\alpha = 0.05$
+
+```{r}
+#--- Test Shapiro-Wilka ---
+set.seed(420)
+shap_test <- shapiro.test(sample(Y_train$CD36, 5000))
+print(shap_test)
+
+#--- Test Andersona-Darlinga --
+ad_test <- ad.test(Y_train$CD36)
+print(ad_test)
+```
+
+W obu przypadkach zważywszy na małe p-value odrzucamy hipotezę zerową, czego można było się spodziewać patrząc na wykres QQ w poprzednim podrozdziale.
+
+---
+
+## 2.3 Testowanie statystyczne dla wybranej zmiennej objaśniającej
+
+Wybieramy najbardziej skorelowaną ze zmienną objaśnianą zmienną objaśniającą.
+
+
+```{r}
+cors <- cor(X_train,Y_train)
+most_cor_name <- colnames(X_train)[which.max(cors)]
+cat("Szukana zmienna z największym współczynnikiem korelacji ze zmienną objaśnianą to : ",most_cor_name, "\n")
+
+```
+
+Przedstawmy znalezioną zmienną na wykresie.
+
+
+```{r}
+# Histogram z gęstością
+ggplot(X_train, aes(x = BLVRB)) +
+  geom_histogram(aes(y = ..density..),
+                 bins = 30,
+                 fill = "lightblue",
+                 color = "black") +
+  geom_density(color = "red", size = 1) +
+  labs(title = "Histogram zmiennej objaśnianejącej",
+       x = "BLVRB",
+       y = "Gęstość") +
+  theme_minimal()
+```
+
+Na podstawie wykresu można wywnioskować, że są przesłanki do tego, żeby rozkład pochodził od rozkładu wykładniczego. Teraz musimy zastanowić się nad parametrem $\lambda$. 
+
+Spróbujmy wyestymować parametr $\lambda$. Użyjemy do tego estymatora największego prawdopodobieństwa. Po koniecznych obliczeniach otrzymujemy, że nasz estymator to $\hat\lambda_{MLE} = \frac{n}{\sum_{i=1}^{n} x_i}$. Więc w naszym przypadku:
+
+```{r}
+cat("Estymator lambda wynosi : ", 1/mean(X_train$BLVRB), "\n")
+```
+
+Popatrzmy na wykres rozkładu empirycznego zmiennej objaśniającej i rozkładu wykładniczego.
+
+
+```{r}
+lambda <- 1.176
+
+ggplot(X_train, aes(x = BLVRB)) +
+  geom_histogram(aes(y = ..density..),
+                 bins  = 30,
+                 fill  = "lightblue",
+                 color = "black") +
+  geom_density(color = "red", size = 1) +           # empiryczna KDE
+  stat_function(fun  = dexp,                        # gęstość Exp(λ)
+                args = list(rate = lambda),
+                colour   = "darkgreen",
+                linetype = "dashed",
+                size     = 1) +
+  labs(title = "BLVRB: histogram, gęstość KDE i teoretyczna Exp(λ = 1.176)",
+       x = "BLVRB",
+       y = "Gęstość") +
+  theme_minimal()
+
+```
+
+
+Chcemy testować zgodność rozkładu empirycznego zmiennej objaśniającej i rozkładu wykładniczego. Użyjemy do tego testu Andersona-Darlinga tak jak w poprzednim przypadku. Test ten dobrze się sprawdza na dużych próbach. Skorzystamy z implementacji z biblioteki goftest, gdzie możemy zmieniać rozkłady, które porównujemy z danymi. 
+
+
+
+$H_0$: Rozkład zmiennej objaśniającej pochodzi z rozkładu wykładniczego $Exp(\lambda = 1,176)$.
+
+$H_1$: Rozkład nie pochodzi z tego rozkładu.
+
+
+Ustalamy następujący poziom istotności : $\alpha = 0.05$
+
+```{r}
+
+ad_test2 <- ad.test(X_train$BLVRB, null = "pexp", rate = lambda)
+print(ad_test2)
+
+```
+
+Odrzucamy hipotezę zerową, więc rozkład BLVRB nie pochodzi z rozkładu wykładniczego.
+
+Chcemy teraz testować, czy nasza zmienna ma podobny rozkład na zbiorze treningowym i testowym. Na początku popatrzmy na oba rozkłady.
+
+```{r}
+
+data <- bind_rows(
+  data.frame(BLVRB = X_train$BLVRB, set = "train"),
+  data.frame(BLVRB = X_test$BLVRB,  set = "test")
+)
+
+ggplot(data, aes(x = BLVRB, fill = set, colour = set)) +
+  geom_density(size = 1, alpha = 0.3) +
+  labs(title = "Rozkłady zmiennej BLVRB w zbiorach treningowym i testowym",
+       x = "BLVRB",
+       y = "Gęstość",
+       fill = "Zbiór",
+       colour = "Zbiór") +
+  theme_minimal()
+
+```
+
+Na pierwszy rzut oka rozkłady te są bardzo podobne. Przeprowadźmy test Wilcoxona, aby się upewnić. Test Wilcoxona porównuje mediany dwóch niezależnych grup, nie wymaga normalności, toleruje różne liczebności i dobrze się sprawdza dla rozkładów takich jak rozkład wykładniczy, a nasze rozkłady dany rozkład przypominają. Są to warunki, które spełnia zmienna BLVRB na zbiorach treningowym i testowym.
+
+$H_0$: Rozkład zmiennej na dwóch zbiorach jest zlokalizowany tak samo.
+
+$H_1$: Rozkład zmiennej nie jest zlokalizowany tak samo.
+
+
+Ustalamy następujący poziom istotności : $\alpha = 0.05$
+
+```{r}
+wilc_test <- wilcox.test(X_train$BLVRB, X_test$BLVRB)
+print(wilc_test)
+
+```
+
+Duże p-value uniemożliwia nam odrzucenie hipotezy zerowej, więc możemy założyć że rozkłady są zlokalizowane tak samo. 
+
+---
+
+# 3. ElasticNet
+
+## 3.1 Opis modelu
+
+
+Elastic Net (EN) to liniowy model regresyjny, który minimalizuje błąd średniokwadratowy wzbogacony o mieszankę dwóch kar regularizacyjnych:
+
+* normy $\ell_2$ (tak jak w ridge),
+* normy $\ell_1$ (tak jak w lasso).
+
+Model więc działa tak jak klasyczne modele regresji, ale jego część regularyzacyjna to połączenie rozwiązań z Ridge Regression oraz Lasso Regression. Dzięki temu łączy stabilizację współczynników (ridge) z selekcją zmiennych (lasso). Model łączy zalety obu regresji.
+
+Mamy dane postaci $(X_i,y_i)_{i=1}^{n}$, $X_i \in \mathbb R^p$, $y \in \mathbb R$. Optymalizowana funkcja celu modelu ma postać:
+
+$$
+\mathcal L(\beta;\lambda,\alpha)=
+\frac{1}{2n}\sum_{i=1}^{n}(y_i-X_i\beta)^2
+\;+\;
+\lambda\!\left[
+(1-\alpha)\,\frac{\lVert\beta\rVert_2^{2}}{2}
+\;+\;
+\alpha\,\lVert\beta\rVert_1
+\right].
+$$
+
+,gdzie:
+
+* $n, p$ - liczba obserwacji i liczba zmiennych
+* $\beta=(\beta_1,\dots,\beta_p)^{\!\top}$ – współczynniki modelu
+* $\lambda$ - hiperparametr kary
+* $\alpha \in (0,1)$ - hiperparametr modelu ElasticNet, który będzie odpowiadał, która z dwóch regularyzacji będzie miała jaki wpływ na model
+* $\lVert\beta\rVert_2^{2}=\sum_{j=1}^{p}\beta_j^{2}$
+* $\lVert\beta\rVert_1 =\sum_{j=1}^{p}|\beta_j|$.
+
+Będziemy szukali takich parametrów $\beta$, która minimalizuje tą funkcję.
+
+
+
+Szczególne przypadki:
+
+* $\alpha = 0$  : **Regresja grzbietowa (ridge)** 
+  
+  $$\mathcal L_{\text{ridge}}
+  =\frac{1}{2n}\lVert y-X\beta\rVert_2^{2}
+     +\lambda\,\frac{\lVert\beta\rVert_2^{2}}{2}.$$
+
+* $\alpha = 1$ :**Regresja Lasso**
+
+  $$\mathcal L_{\text{lasso}}
+    =\frac{1}{2n}\lVert y-X\beta\rVert_2^{2}
+     +\lambda\,\lVert\beta\rVert_1.$$
+
+---
+
+## 3.2 Trenowanie modelu na różnych hiperparametrach
+
+Poniższy kod tworzy najpierw tworzy foldy. Będę używal walidacji krzyżowej z 5 foldami z uwago na ograniczoną moc obliczeniową. Aby wynik był dokładny najlepiej byłoby użyć 10 foldów. Kod następnie tworzy siatkę hiperparametrów, gdzie $\alpha \in (0, 0.25, 0.5, 0.75, 1)$ oraz $\lambda \in (10, 1, 0.1, 0.01)$. Później w pętli trenujemy model po pierwsze na każdym foldzie, a po drugie z każdą kombinacją alf i lambd.
+
+```{r}
+
+X_mat <- as.matrix(X_train)
+y_vec <- as.numeric(Y_train$CD36)
+
+k <- 5
+make_folds <- function(y, k = 5, seed = 420) {
+  set.seed(seed)
+  strata <- ifelse(y == 0, "zero", "nonzero")
+  folds  <- integer(length(y))
+  for (s in unique(strata)) {
+    idx <- which(strata == s)
+    folds[idx] <- sample(rep(seq_len(k), length.out = length(idx)))
+  }
+  folds
+}
+fold_id <- make_folds(y_vec, k)
+
+
+alpha_grid  <- c(0, 0.25, 0.5, 0.75, 1)     
+lambda_grid <- 10 ^ seq(1, -2, length.out = 4)  
+
+cv_results   <- data.frame(alpha = numeric(),
+                           lambda = numeric(),
+                           mse    = numeric())
+fold_results <- data.frame(alpha = numeric(),
+                           lambda = numeric(),
+                           fold  = integer(),
+                           mse   = numeric())  
+
+for (a in alpha_grid) {
+  for (l in lambda_grid) {
+    
+    mse_fold <- numeric(k)
+    
+    for (fold in seq_len(k)) {
+      train_idx <- fold_id != fold
+      test_idx  <- fold_id == fold
+      
+      mod <- glmnet(
+        x      = X_mat[train_idx, , drop = FALSE],
+        y      = y_vec[train_idx],
+        alpha  = a,
+        lambda = l,
+        family = "gaussian"
+      )
+      pred <- predict(mod, s = l,
+                      newx = X_mat[test_idx, , drop = FALSE])
+      mse_fold[fold] <- mean((y_vec[test_idx] - pred)^2)
+    }
+    
+
+    cv_results <- rbind(cv_results,
+                        data.frame(alpha  = a,
+                                   lambda = l,
+                                   mse    = mean(mse_fold)))
+    
+
+    fold_results <- rbind(fold_results,
+                          data.frame(alpha  = rep(a, k),
+                                     lambda = rep(l, k),
+                                     fold   = seq_len(k),
+                                     mse    = mse_fold))
+    
+  }
+}
+
+best_row <- cv_results[which.min(cv_results$mse), ]
+print(best_row)
+
+
+```
+
+Widzimy, że najlepszą parą hiperparametrów, gdzie błąd średniokwadratowy jest najmniejszy to $\alpha = 1, \lambda = 0.01$. Zauważmy, że najlepiej spisał się model LASSO, ponieważ $\alpha = 1$
+
+
+## 3.3 Wykresy skrzypcowe błędów średniokwadratowych
+
+Poniższe wykresy dzielą się na 5, dla każdego $\alpha$, a w każdym z nich są wykresy skrzypcowe dla każdego $\lambda$. Na wykresach zaznaczone są wartości MSE dla każdego foldu przez kropkę oraz średnią z nich przez krzyżyk.
+
+
+```{r, fig.width=10, fig.height=6}
+
+fold_results <- fold_results %>%
+  mutate(alpha_f  = factor(alpha),
+         lambda_f = factor(signif(lambda, 2)))  
+
+unique_alphas <- levels(fold_results$alpha_f)
+plots <- vector("list", length(unique_alphas))
+names(plots) <- paste0("alpha_", unique_alphas)
+
+for (i in seq_along(unique_alphas)) {
+  a <- unique_alphas[i]
+  data_subset <- filter(fold_results, alpha_f == a)
+
+  p <- ggplot(data_subset, aes(x = lambda_f, y = mse, fill = lambda_f)) +
+    geom_violin(trim = FALSE, alpha = 1, colour = NA, width = 2) +
+    geom_point(position = position_jitter(width = 0.10, height = 0),
+               size = 1.8, alpha = 0.7, colour = "black") +
+    stat_summary(fun = mean, geom = "point",
+                 shape = 4, size = 3, stroke = 1.1, colour = "red") +
+    scale_fill_brewer(palette = "Set3", name = expression(lambda)) +
+    labs(title = paste("α =", a, "— rozkład MSE (5-fold CV)"),
+         x     = expression(lambda),
+         y     = "MSE (fold test)") +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "none",
+      axis.text.x     = element_text(angle = 0)
+    )
+
+  plots[[i]] <- p
+}
+for (pl in plots) print(pl)
+
+```
+
+
+## 3.3 Błąd dla najlepszych hiperparametrów
+
+Policzmy błąd średniokwadratowy na zbiorze treningowym i walidacyjnym.
+
+```{r}
+
+alpha_best  <- best_row$alpha
+lambda_best <- best_row$lambda
+
+train_mse_en <- numeric(k)
+val_mse_en   <- numeric(k)
+
+for (fold in 1:k) {
+  idx_tr <- fold_id != fold
+  idx_te <- fold_id == fold
+  
+  fit <- glmnet(
+    x      = X_mat[idx_tr, , drop = FALSE],
+    y      = y_vec[idx_tr],
+    alpha  = alpha_best,
+    lambda = lambda_best,
+    family = "gaussian"
+  )
+  
+
+  pred_tr <- predict(fit, s = lambda_best,
+                     newx = X_mat[idx_tr, , drop = FALSE])
+  pred_te <- predict(fit, s = lambda_best,
+                     newx = X_mat[idx_te, , drop = FALSE])
+  
+  train_mse_en[fold] <- mean((y_vec[idx_tr] - pred_tr)^2)
+  val_mse_en  [fold] <- mean((y_vec[idx_te] - pred_te)^2)
+}
+
+avg_train_mse_en <- mean(train_mse_en)
+avg_val_mse_en   <- mean(val_mse_en)
+
+cat("Elastic Net  (α =", alpha_best, ", λ =", lambda_best, ")\n")
+cat("Średni MSE  na zbiorze treningowym:", avg_train_mse_en, "\n")
+cat("Średni MSE  na danych walidacyjnych:", avg_val_mse_en, "\n")
+
+
+```
+
+
+Różnica rzędu kilkudziesięciu procent między wartościami sugeruje, że mogło pojawić się przeuczenie, czyli model nauczył się danych tylko na zbiorze treningowym.
+
+
+# 4. Lasy Losowe
+
+## 4.1 Trenowanie modelu na różnych hiperparametrach
+
+Wytrenujemy teraz kilka modeli lasów losowych. Hiperparametry, które będziemy zmieniać to maksymalna głębokośc (max.depth), liczba drzew (n.trees) oraz maksymalna liczba zmiennych.
+
+```{r}
+X_df  <- as.data.frame(X_mat)      
+X_df$y <- y_vec               
+                          
+p <- ncol(X_mat)   
+
+grid_rf <- expand.grid(
+  num.trees = c(50, 100, 150),      
+  mtry      = c(round(0.5*sqrt(p)),   
+                round(sqrt(p))), 
+  max.depth = c(5, 10, 15)               
+)
+
+
+results_rf  <- data.frame()  
+fold_mse_rf <- data.frame()  
+
+for (i in seq_len(nrow(grid_rf))) {
+  g <- grid_rf[i, ]
+  mse_fold <- numeric(k)
+  
+  for (f in 1:k) {
+    idx_tr <- fold_id != f
+    idx_te <- fold_id == f
+    
+    fit <- ranger(
+      y ~ .,
+      data      = X_df[idx_tr, ],
+      num.trees = g$num.trees,
+      mtry      = g$mtry,
+      max.depth = g$max.depth,
+      min.node.size = 1,
+      seed      = 420,
+      respect.unordered.factors = "partition",
+      verbose   = FALSE
+    )
+    
+    pred <- predict(fit, data = X_df[idx_te, ])$predictions
+    mse_fold[f] <- mean((y_vec[idx_te] - pred)^2)
+    
+    fold_mse_rf <- rbind(fold_mse_rf,
+      data.frame(num.trees = g$num.trees,
+                 mtry      = g$mtry,
+                 max.depth = g$max.depth,
+                 fold      = f,
+                 mse       = mse_fold[f]))
+  }
+  
+  results_rf <- rbind(results_rf,
+      data.frame(g, mean_mse = mean(mse_fold)))
+}
+
+best_rf <- results_rf %>% arrange(mean_mse) %>% slice(1)
+cat("Najlepsza konfiguracja: \n")
+print(best_rf)
+
+```
+
+
+
+
+## 4.2 Wykresy pudełkowe wyników 
+
+Obrazujemy teraz MSE na 3 wykresach w zależności od głębokości. Na każdym wykresie znajduje się 6 box-plotów, które odpowiadają kombinacją hiperparametrów.
+
+```{r}
+fold_all <- fold_mse_rf %>% 
+  mutate(
+    mtry_f = factor(mtry,  levels = sort(unique(mtry))),
+    nt_f   = factor(num.trees, levels = c(50, 100, 150)),
+    cfg    = paste0("nt=", nt_f, "\nmt=", mtry_f)  
+  )
+
+depth_vals <- sort(unique(fold_all$max.depth))  
+for (d in depth_vals) {
+  
+  p <- fold_all %>% filter(max.depth == d) %>%
+    ggplot(aes(x = cfg, y = mse, fill = nt_f)) +
+      geom_boxplot(outlier.shape = NA, width = .7,
+                   alpha = .35, colour = "grey35") +
+      geom_point(position = position_jitter(width = .15, height = 0),
+                 size = 1.8, alpha = .7, colour = "black") +
+      scale_fill_brewer(palette = "Set2", name = "num.trees") +
+      stat_summary(fun = mean, geom = "point",
+                   shape = 3, size = 3.5, stroke = 1.1, colour = "red") +
+      labs(title = paste("Random Forest – max.depth =", d),
+           x     = "nt = liczba drzew | mtry = maks. liczba zmiennych",
+           y     = "MSE (fold test)",
+           caption = "Czarne punkty – MSE foldów, Czerwony + – średnia MSE") +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title  = element_text(size = 14, face = "bold")
+      )
+  
+  print(p)  
+}
+
+
+```
+
+
+## 4.3 Błąd dla najlepszych hiperparametrów
+
+Teraz bierzemy najlepsze hiperparametry i trenujemy model, żeby otrzymać błąd na zbiorze walidacyjnym i treningowym.
+
+```{r}
+nt_best  <- best_rf$num.trees
+mtry_best<- best_rf$mtry
+depth_best <- best_rf$max.depth
+
+train_mse <- numeric(k)
+val_mse   <- numeric(k)
+
+for (f in 1:k) {
+  idx_tr <- fold_id != f
+  idx_te <- fold_id == f
+  
+  fit <- ranger(
+    y ~ .,
+    data            = X_df[idx_tr, ],
+    num.trees       = nt_best,
+    mtry            = mtry_best,
+    max.depth       = depth_best,
+    min.node.size   = 1,
+    seed            = 420,
+    respect.unordered.factors = "partition",
+    verbose         = FALSE
+  )
+  
+  pred_tr <- predict(fit, data = X_df[idx_tr, ])$predictions
+  pred_te <- predict(fit, data = X_df[idx_te, ])$predictions
+  
+  train_mse[f] <- mean((X_df$y[idx_tr] - pred_tr)^2)
+  val_mse[f]   <- mean((X_df$y[idx_te] - pred_te)^2)
+}
+
+avg_train <- mean(train_mse)
+avg_val   <- mean(val_mse)
+
+cat("Random Forest  (nt =", nt_best,
+    ",  mtry =", mtry_best,
+    ",  max.depth =", depth_best, ")\n")
+cat("Średni MSE zbiór treningowy :", avg_train, "\n")
+cat("Średni MSE zbiór walidacyjny :", avg_val, "\n")
+
+```
+
+Tutaj również możemy zauwaćyć, że model slabo generalizuje.
+
+
+# 5. Podsumowanie
+
+Zacznijmy od modelu referencyjnego, który zmiennyym objaśniającym w foldzie testowym przypisuje średnią arytmetyczną zmiennej objaśnianej policzoną w foldach treningowych.
+
+
+```{r}
+
+mse_ref_val <- numeric(length(k))   # tu zbierzemy błędy walidacyjne
+mse_ref_tr   <- numeric(length(k))   # i treningowe (opcjonalnie)
+
+for (i in 1:k) {
+  idx_tr <- fold_id != i
+  idx_te <- fold_id == i
+  
+  y_bar  <- mean(y_vec[idx_tr])      
+  
+  mse_ref_tr[i] <- mean( (y_vec[idx_tr] - y_bar)^2 )
+  mse_ref_val[i] <- mean( (y_vec[idx_te] - y_bar)^2 )
+}
+
+#  ramka z wynikami per-fold  (łatwa do rbind z innymi modelami)
+ref_results_df <- data.frame(
+  Fold            = seq_along(1:k),
+  Ref_MSE_Train   = mse_ref_tr,
+  Ref_MSE_Val     = mse_ref_val
+)
+
+#  średnie – do szybkiego podglądu
+avg_train_ref <- mean(mse_ref_tr)
+avg_val_ref   <- mean(mse_ref_val)
+
+cat("Średni MSE na zbiorze treningowym model referencyjny :", round(avg_train_ref, 5), "\n")
+cat("Średni MSE na zbiorze walidacyjnym model referencyjny :", round(avg_val_ref,   5), "\n")
+
+
+```
+
+
+Aby podsumować wyniki wypisujemy poniższą tabele.
+
+```{r}
+
+train_mse_rf <- train_mse  
+val_mse_rf   <- val_mse
+
+mse_tbl <- data.frame(
+  Fold           = 1:k,
+  EN_Train_MSE   = round(train_mse_en, 5),
+  EN_Val_MSE     = round(val_mse_en,   5),
+  RF_Train_MSE   = round(train_mse_rf, 5),
+  RF_Val_MSE     = round(val_mse_rf,   5),
+  REF_Train_MSE  = round(mse_ref_tr,   5),
+  REF_Val_MSE    = round(mse_ref_val,  5)
+)
+
+avg_row <- data.frame(
+  Fold           = "AVG",
+  EN_Train_MSE   = round(mean(train_mse_en), 5),
+  EN_Val_MSE     = round(mean(val_mse_en),   5),
+  RF_Train_MSE   = round(mean(train_mse_rf), 5),
+  RF_Val_MSE     = round(mean(val_mse_rf),   5),
+  REF_Train_MSE  = round(mean(mse_ref_tr),   5),
+  REF_Val_MSE    = round(mean(mse_ref_val),  5)
+)
+
+mse_tbl <- rbind(mse_tbl, avg_row)
+
+print(mse_tbl)
+```
+
+
+Podsumowując wyniki najlepsze uzyskał model ElasticNet. Model ten jest również bardziej wytłumaczlany niż lasy losowe i równiez szybszy.
+
+Uważam, że wyniki można było uzyskać lepsze i dokładniejsze. Dokładniejsze, dlatego że powinniśmy użyć 10 foldów co jest często stosowaną liczbą. Lepsze przez dokładniejszy tuning hiperparametrów. Już na ten moment, gdy gridy hiperparametrów w podpunkcie 3 i 4 były stosunkowo małe czas obliczeniowy na ograniczonym sprzęcie wyniósł bardzo długo (Ciekawostka: plik html bez rozdziału 5 renderował się 57 minut). Jeśli poszerzylibyśmy siatki myślę, że uzyskalibyśmy lepsze wyniki. 
+
+
+
+
+
+
+
+
+
+
